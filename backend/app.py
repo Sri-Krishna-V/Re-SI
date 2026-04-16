@@ -1,4 +1,4 @@
-from fastapi import FastAPI, UploadFile, File, HTTPException, Form
+from fastapi import FastAPI, UploadFile, File, HTTPException, Request
 from fastapi.responses import StreamingResponse, FileResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
@@ -14,10 +14,19 @@ import tempfile
 import shutil
 import re
 import logging
-import traceback
 from adk_optimizer import SkillOptimizer
+from observability import (
+    configure_logging,
+    event_extra,
+    get_request_id,
+    init_tracing,
+    instrument_fastapi,
+    reset_request_id,
+    set_request_id,
+    traced_span,
+)
 
-logging.basicConfig(level=logging.INFO)
+configure_logging()
 logger = logging.getLogger(__name__)
 
 MAX_UPLOAD_SIZE = 10 * 1024 * 1024  # 10 MB total
@@ -38,6 +47,34 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+@app.middleware("http")
+async def request_context_middleware(request: Request, call_next):
+    """Attach request IDs and structured timing logs for every HTTP request."""
+    token = set_request_id(request.headers.get("x-request-id"))
+    started = time.perf_counter()
+    response = None
+    try:
+        response = await call_next(request)
+        return response
+    except Exception:
+        logger.exception(
+            "Unhandled request error",
+            extra=event_extra(event_type="http_error"),
+        )
+        raise
+    finally:
+        duration_ms = round((time.perf_counter() - started) * 1000, 2)
+        if response is not None:
+            response.headers["X-Request-ID"] = get_request_id()
+        status_code = response.status_code if response is not None else 500
+        logger.info(
+            f"{request.method} {request.url.path} completed with {status_code}",
+            extra=event_extra(event_type="http_request",
+                              duration_ms=duration_ms),
+        )
+        reset_request_id(token)
 
 sessions: Dict[str, dict] = {}
 
@@ -125,10 +162,12 @@ def _is_safe_path(name: str) -> bool:
 async def upload_skill(file: UploadFile = File(...)):
     """Accept zip file or multiple files, extract, return file list + parsed SKILL.md metadata"""
     if not file.filename.endswith(".zip"):
-        raise HTTPException(status_code=400, detail="Only .zip files are accepted")
+        raise HTTPException(
+            status_code=400, detail="Only .zip files are accepted")
     content = await file.read()
     if len(content) > MAX_UPLOAD_SIZE:
-        raise HTTPException(status_code=413, detail=f"Upload exceeds {MAX_UPLOAD_SIZE // (1024*1024)}MB limit")
+        raise HTTPException(
+            status_code=413, detail=f"Upload exceeds {MAX_UPLOAD_SIZE // (1024*1024)}MB limit")
     try:
         with zipfile.ZipFile(io.BytesIO(content)) as zf:
             skill_files = {}
@@ -144,10 +183,12 @@ async def upload_skill(file: UploadFile = File(...)):
                     continue
                 raw = zf.read(name)
                 if len(raw) > MAX_FILE_SIZE:
-                    logger.warning(f"Skipping oversized file: {name} ({len(raw)} bytes)")
+                    logger.warning(
+                        f"Skipping oversized file: {name} ({len(raw)} bytes)")
                     continue
                 if len(file_list) >= MAX_FILE_COUNT:
-                    logger.warning("Max file count reached, skipping remaining entries")
+                    logger.warning(
+                        "Max file count reached, skipping remaining entries")
                     break
                 file_content = raw.decode("utf-8", errors="ignore")
                 skill_files[name] = file_content
@@ -157,7 +198,8 @@ async def upload_skill(file: UploadFile = File(...)):
             if file_list:
                 common = os.path.commonpath(file_list)
                 if common and common != file_list[0]:
-                    skill_files = {os.path.relpath(k, common): v for k, v in skill_files.items()}
+                    skill_files = {os.path.relpath(
+                        k, common): v for k, v in skill_files.items()}
                     file_list = [os.path.relpath(f, common) for f in file_list]
 
             return create_session_from_files(skill_files, file_list)
@@ -165,8 +207,9 @@ async def upload_skill(file: UploadFile = File(...)):
         raise HTTPException(status_code=400, detail="Invalid zip file")
     except HTTPException:
         raise
-    except Exception as e:
-        logger.error(f"Upload error: {traceback.format_exc()}")
+    except Exception:
+        logger.exception("Upload error", extra=event_extra(
+            event_type="upload_error"))
         raise HTTPException(status_code=500, detail="Error processing file")
 
 
@@ -174,7 +217,8 @@ async def upload_skill(file: UploadFile = File(...)):
 async def upload_files(files: List[UploadFile] = File(...)):
     """Accept multiple files (folder upload via webkitdirectory)"""
     if len(files) > MAX_FILE_COUNT:
-        raise HTTPException(status_code=413, detail=f"Too many files (max {MAX_FILE_COUNT})")
+        raise HTTPException(
+            status_code=413, detail=f"Too many files (max {MAX_FILE_COUNT})")
     skill_files = {}
     file_list = []
     total_size = 0
@@ -191,9 +235,11 @@ async def upload_files(files: List[UploadFile] = File(...)):
         content = await f.read()
         total_size += len(content)
         if total_size > MAX_UPLOAD_SIZE:
-            raise HTTPException(status_code=413, detail=f"Total upload exceeds {MAX_UPLOAD_SIZE // (1024*1024)}MB limit")
+            raise HTTPException(
+                status_code=413, detail=f"Total upload exceeds {MAX_UPLOAD_SIZE // (1024*1024)}MB limit")
         if len(content) > MAX_FILE_SIZE:
-            logger.warning(f"Skipping oversized file: {name} ({len(content)} bytes)")
+            logger.warning(
+                f"Skipping oversized file: {name} ({len(content)} bytes)")
             continue
         skill_files[name] = content.decode("utf-8", errors="ignore")
         file_list.append(name)
@@ -202,7 +248,8 @@ async def upload_files(files: List[UploadFile] = File(...)):
     if file_list:
         common = os.path.commonpath(file_list)
         if common and common != file_list[0]:
-            skill_files = {os.path.relpath(k, common): v for k, v in skill_files.items()}
+            skill_files = {os.path.relpath(
+                k, common): v for k, v in skill_files.items()}
             file_list = [os.path.relpath(f, common) for f in file_list]
 
     return create_session_from_files(skill_files, file_list)
@@ -214,22 +261,44 @@ async def analyze_skill(request: AnalyzeRequest):
     if request.session_id not in sessions:
         raise HTTPException(status_code=404, detail="Session not found")
     session = sessions[request.session_id]
+    started = time.perf_counter()
+    logger.info(
+        "Skill analysis started",
+        extra=event_extra(session_id=request.session_id,
+                          event_type="analysis_start"),
+    )
     try:
-        optimizer = SkillOptimizer(api_key=request.gemini_api_key)
-        analysis = await optimizer.analyze_skill(session["skill_files"])
+        with traced_span("api.analyze_skill", {"session.id": request.session_id}):
+            optimizer = SkillOptimizer(api_key=request.gemini_api_key)
+            analysis = await optimizer.analyze_skill(session["skill_files"])
         session["scenarios"] = analysis["scenarios"]
         session["evals"] = analysis["evals"]
         session["status"] = "analyzed"
+        duration_ms = round((time.perf_counter() - started) * 1000, 2)
+        logger.info(
+            "Skill analysis completed",
+            extra=event_extra(
+                session_id=request.session_id,
+                event_type="analysis_complete",
+                duration_ms=duration_ms,
+            ),
+        )
         return {"scenarios": analysis["scenarios"], "evals": analysis["evals"]}
-    except Exception as e:
-        logger.error(f"Analysis error: {traceback.format_exc()}")
-        raise HTTPException(status_code=500, detail="Analysis failed. Check your API key and try again.")
+    except Exception:
+        logger.exception(
+            "Analysis error",
+            extra=event_extra(session_id=request.session_id,
+                              event_type="analysis_error"),
+        )
+        raise HTTPException(
+            status_code=500, detail="Analysis failed. Check your API key and try again.")
 
 
 @app.post("/api/regenerate")
 async def regenerate_config(request: RegenerateRequest):
     """Regenerate scenarios/evals for a session"""
-    analyze_req = AnalyzeRequest(session_id=request.session_id, gemini_api_key=request.gemini_api_key)
+    analyze_req = AnalyzeRequest(
+        session_id=request.session_id, gemini_api_key=request.gemini_api_key)
     return await analyze_skill(analyze_req)
 
 
@@ -253,6 +322,10 @@ async def stream_progress(session_id: str):
     session = sessions[session_id]
 
     async def event_generator():
+        logger.info(
+            "SSE stream opened",
+            extra=event_extra(session_id=session_id, event_type="stream_open"),
+        )
         if "event_queue" not in session:
             session["event_queue"] = asyncio.Queue()
         queue = session["event_queue"]
@@ -261,12 +334,21 @@ async def stream_progress(session_id: str):
                 event = await queue.get()
                 if event is None:
                     break
+                if isinstance(event, dict):
+                    meta = event.setdefault("meta", {})
+                    meta.setdefault("session_id", session_id)
+                    meta.setdefault("request_id", get_request_id())
                 yield f"data: {json.dumps(event)}\n\n"
         except asyncio.CancelledError:
             pass
         finally:
             if "event_queue" in session:
                 del session["event_queue"]
+            logger.info(
+                "SSE stream closed",
+                extra=event_extra(session_id=session_id,
+                                  event_type="stream_close"),
+            )
 
     return StreamingResponse(
         event_generator(),
@@ -282,22 +364,48 @@ async def start_optimization(session_id: str, request: StartRequest):
         raise HTTPException(status_code=404, detail="Session not found")
     session = sessions[session_id]
     if not session.get("scenarios") or not session.get("evals"):
-        raise HTTPException(status_code=400, detail="Must configure scenarios and evals first")
+        raise HTTPException(
+            status_code=400, detail="Must configure scenarios and evals first")
     if session.get("status") == "running":
-        raise HTTPException(status_code=400, detail="RSI cycle already running")
+        raise HTTPException(
+            status_code=400, detail="RSI cycle already running")
 
     session["status"] = "running"
     session["stop_requested"] = False
     # Pre-create the event queue so events aren't lost before SSE connects
     session["event_queue"] = asyncio.Queue()
     gemini_key = request.gemini_api_key
+    request_id = get_request_id()
+
+    logger.info(
+        "Optimization request accepted",
+        extra=event_extra(session_id=session_id,
+                          event_type="optimization_requested"),
+    )
 
     async def run_optimization():
-        logger.info(f"Starting RSI cycle for session {session_id}")
+        token = set_request_id(request_id)
+        run_started = time.perf_counter()
+        logger.info(
+            f"Starting RSI cycle for session {session_id}",
+            extra=event_extra(session_id=session_id,
+                              event_type="optimization_start"),
+        )
         optimizer = SkillOptimizer(api_key=gemini_key)
 
         async def callback(event):
-            logger.info(f"Callback event: {event['type']}")
+            event_type = event.get("type", "unknown")
+            if isinstance(event, dict):
+                meta = event.setdefault("meta", {})
+                meta.setdefault("session_id", session_id)
+                meta.setdefault("request_id", request_id)
+                meta.setdefault("event_type", event_type)
+
+            logger.info(
+                f"Callback event: {event_type}",
+                extra=event_extra(session_id=session_id,
+                                  event_type=event_type),
+            )
             if "event_queue" in session:
                 await session["event_queue"].put(event)
             if event["type"] == "baseline":
@@ -349,14 +457,27 @@ async def start_optimization(session_id: str, request: StartRequest):
                     await session["event_queue"].put(None)
 
         try:
-            result = await optimizer.optimize(
-                skill_files=session["skill_files"],
-                scenarios=session["scenarios"],
-                evals=session["evals"],
-                max_rounds=request.max_rounds,
-                callback=callback,
+            with traced_span(
+                "api.optimize_session",
+                {
+                    "session.id": session_id,
+                    "max_rounds": request.max_rounds,
+                    "scenario.count": len(session.get("scenarios", [])),
+                    "eval.count": len(session.get("evals", [])),
+                },
+            ):
+                result = await optimizer.optimize(
+                    skill_files=session["skill_files"],
+                    scenarios=session["scenarios"],
+                    evals=session["evals"],
+                    max_rounds=request.max_rounds,
+                    callback=callback,
+                )
+            logger.info(
+                f"RSI cycle complete: {result['baseline_score']}% -> {result['final_score']}%",
+                extra=event_extra(session_id=session_id,
+                                  event_type="optimization_complete"),
             )
-            logger.info(f"RSI cycle complete: {result['baseline_score']}% -> {result['final_score']}%")
             # Don't overwrite final_result if callback already set it with transformed data
             if not session.get("final_result"):
                 ml = result.get("mutation_log", [])
@@ -384,13 +505,38 @@ async def start_optimization(session_id: str, request: StartRequest):
                 }
             session["current_skill_md"] = result["improved_skill_md"]
             session["status"] = "complete"
-        except Exception as e:
-            logger.error(f"RSI cycle error: {traceback.format_exc()}")
+        except Exception as exc:
+            logger.exception(
+                "RSI cycle error",
+                extra=event_extra(session_id=session_id,
+                                  event_type="optimization_error"),
+            )
             session["status"] = "error"
-            session["error"] = str(e)
+            session["error"] = str(exc)
             if "event_queue" in session:
-                await session["event_queue"].put({"type": "error", "data": {"message": str(e)}})
+                await session["event_queue"].put(
+                    {
+                        "type": "error",
+                        "data": {"message": str(exc)},
+                        "meta": {
+                            "session_id": session_id,
+                            "request_id": request_id,
+                            "event_type": "error",
+                        },
+                    }
+                )
                 await session["event_queue"].put(None)
+        finally:
+            duration_ms = round((time.perf_counter() - run_started) * 1000, 2)
+            logger.info(
+                "Optimization background task ended",
+                extra=event_extra(
+                    session_id=session_id,
+                    event_type="optimization_task_end",
+                    duration_ms=duration_ms,
+                ),
+            )
+            reset_request_id(token)
 
     asyncio.create_task(run_optimization())
     return {"status": "started"}
@@ -416,7 +562,8 @@ async def download_skill(session_id: str):
         raise HTTPException(status_code=404, detail="Session not found")
     session = sessions[session_id]
     if not session.get("current_skill_md"):
-        raise HTTPException(status_code=400, detail="No RSI-improved skill available")
+        raise HTTPException(
+            status_code=400, detail="No RSI-improved skill available")
     temp_dir = tempfile.mkdtemp()
     zip_path = os.path.join(temp_dir, "rsi_improved_skill.zip")
     try:
@@ -427,7 +574,8 @@ async def download_skill(session_id: str):
                 else:
                     zf.writestr(filename, content)
             if session.get("final_result"):
-                changelog_content = json.dumps(session["final_result"]["changelog"], indent=2)
+                changelog_content = json.dumps(
+                    session["final_result"]["changelog"], indent=2)
                 zf.writestr("CHANGELOG.json", changelog_content)
             return FileResponse(zip_path, media_type="application/zip", filename="rsi_improved_skill.zip")
     finally:
@@ -445,7 +593,8 @@ async def cleanup_temp_dir(temp_dir: str):
 @app.get("/api/examples")
 async def list_examples():
     """List available example skills"""
-    examples_dir = os.path.join(os.path.dirname(__file__), "..", "example_skills")
+    examples_dir = os.path.join(
+        os.path.dirname(__file__), "..", "example_skills")
     examples = []
     if os.path.exists(examples_dir):
         for name in sorted(os.listdir(examples_dir)):
@@ -455,7 +604,8 @@ async def list_examples():
                 with open(skill_md_path, "r") as f:
                     content = f.read()
                 metadata = parse_skill_frontmatter(content)
-                examples.append({"name": metadata.get("name", name), "description": metadata.get("description", ""), "path": name})
+                examples.append({"name": metadata.get(
+                    "name", name), "description": metadata.get("description", ""), "path": name})
     return {"examples": examples}
 
 
@@ -464,7 +614,8 @@ async def load_example(example_name: str):
     """Load an example skill as if it were uploaded"""
     if not re.fullmatch(r"[a-zA-Z0-9_-]+", example_name):
         raise HTTPException(status_code=400, detail="Invalid example name")
-    examples_dir = os.path.realpath(os.path.join(os.path.dirname(__file__), "..", "example_skills"))
+    examples_dir = os.path.realpath(os.path.join(
+        os.path.dirname(__file__), "..", "example_skills"))
     skill_dir = os.path.realpath(os.path.join(examples_dir, example_name))
     if not skill_dir.startswith(examples_dir + os.sep):
         raise HTTPException(status_code=400, detail="Invalid example name")
@@ -503,6 +654,17 @@ async def health_check():
     return {"status": "healthy"}
 
 
+@app.get("/health/observability")
+async def health_observability():
+    return {
+        "status": "healthy",
+        "otel_enabled": os.getenv("OBSERVABILITY_OTEL_ENABLED", "false"),
+        "otlp_endpoint_configured": bool(os.getenv("OTEL_EXPORTER_OTLP_ENDPOINT", "").strip()),
+        "prompt_capture_mode": os.getenv("OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT", "NO_CONTENT"),
+        "logs_bucket_configured": bool(os.getenv("LOGS_BUCKET_NAME", "").strip()),
+    }
+
+
 async def _cleanup_expired_sessions():
     """Periodically remove sessions older than SESSION_TTL."""
     while True:
@@ -521,6 +683,9 @@ async def _cleanup_expired_sessions():
 
 @app.on_event("startup")
 async def startup():
+    tracing_on = init_tracing(service_name="re-si-backend")
+    if tracing_on:
+        instrument_fastapi(app)
     asyncio.create_task(_cleanup_expired_sessions())
 
 

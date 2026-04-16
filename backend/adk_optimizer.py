@@ -7,7 +7,9 @@
 """
 
 import json
+import logging
 import os
+import time
 from typing import Callable, List, Optional
 
 from pydantic import BaseModel, Field
@@ -16,6 +18,10 @@ from google.adk.agents import Agent
 from google.adk.runners import Runner
 from google.adk.sessions import InMemorySessionService
 from google.genai import types
+from observability import event_extra, traced_span
+
+
+logger = logging.getLogger(__name__)
 
 
 # -- Pydantic schemas for structured agent output ----------------------------
@@ -26,12 +32,14 @@ class FailureAnalysis(BaseModel):
     mutation_strategy: str = Field(
         description="One of: add_example, add_constraint, restructure, add_edge_case"
     )
-    target_section: str = Field(description="Which part of the skill to change")
+    target_section: str = Field(
+        description="Which part of the skill to change")
     suggested_change: str = Field(description="What specific change to make")
 
 
 class SkillMutation(BaseModel):
-    description: str = Field(description="Short description of the change made")
+    description: str = Field(
+        description="Short description of the change made")
     reasoning: str = Field(description="Why this change should help")
     new_skill_md: str = Field(description="The full updated SKILL.md content")
 
@@ -46,6 +54,23 @@ class SkillOptimizer:
         self.model = model
         self._session_service = InMemorySessionService()
         self._call_id = 0
+        self._capture_mode = self._normalize_capture_mode(
+            os.getenv(
+                "OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT", "NO_CONTENT")
+        )
+        self._logs_bucket_name = os.getenv("LOGS_BUCKET_NAME", "").strip()
+        self._prompt_logging_enabled = (
+            bool(self._logs_bucket_name) and self._capture_mode != "disabled"
+        )
+
+        logger.info(
+            "SkillOptimizer initialized",
+            extra=event_extra(
+                event_type="optimizer_init",
+                capture_mode=self._capture_mode,
+                prompt_logging_enabled=self._prompt_logging_enabled,
+            ),
+        )
 
         self.executor = Agent(
             name="executor",
@@ -83,28 +108,88 @@ class SkillOptimizer:
             output_schema=SkillMutation,
         )
 
+    @staticmethod
+    def _normalize_capture_mode(raw_mode: str) -> str:
+        normalized = (raw_mode or "NO_CONTENT").strip().upper()
+        if normalized in {"FALSE", "OFF", "DISABLED", "NONE"}:
+            return "disabled"
+        if normalized in {"TRUE", "FULL", "CONTENT"}:
+            return "full"
+        return "metadata"
+
+    def _log_prompt_response(
+        self,
+        *,
+        phase: str,
+        agent_name: str,
+        prompt: str,
+        response: Optional[str] = None,
+        duration_ms: Optional[float] = None,
+    ) -> None:
+        if not self._prompt_logging_enabled:
+            return
+
+        extra = event_extra(
+            event_type=f"llm_{phase}",
+            duration_ms=duration_ms,
+            agent_name=agent_name,
+            capture_mode=self._capture_mode,
+            prompt_chars=len(prompt),
+            response_chars=len(response) if response is not None else "-",
+        )
+
+        # Only include message content when explicitly enabled.
+        if self._capture_mode == "full":
+            extra["prompt_text"] = prompt
+            if response is not None:
+                extra["response_text"] = response
+
+        logger.info("Prompt-response telemetry", extra=extra)
+
     # -- Agent runner helpers ------------------------------------------------
 
     async def _ask(self, agent: Agent, prompt: str) -> str:
         """Run an ADK agent with a prompt, return text response."""
+        started = time.perf_counter()
         self._call_id += 1
         uid = f"u{self._call_id}"
-        runner = Runner(
-            agent=agent, app_name="skill_opt", session_service=self._session_service
+        self._log_prompt_response(
+            phase="request", agent_name=agent.name, prompt=prompt)
+
+        try:
+            with traced_span("adk.call_llm", {"agent.name": agent.name}):
+                runner = Runner(
+                    agent=agent, app_name="skill_opt", session_service=self._session_service
+                )
+                session = await self._session_service.create_session(
+                    app_name="skill_opt", user_id=uid
+                )
+                text = ""
+                async for event in runner.run_async(
+                    user_id=uid,
+                    session_id=session.id,
+                    new_message=types.Content(parts=[types.Part(text=prompt)]),
+                ):
+                    if hasattr(event, "content") and event.content:
+                        for part in event.content.parts or []:
+                            if hasattr(part, "text") and part.text:
+                                text += part.text
+        except Exception:
+            logger.exception(
+                "ADK runner call failed",
+                extra=event_extra(event_type="llm_error",
+                                  agent_name=agent.name),
+            )
+            raise
+
+        duration_ms = round((time.perf_counter() - started) * 1000, 2)
+        self._log_prompt_response(
+            phase="response",
+            agent_name=agent.name,
+            prompt=prompt,
+            response=text,
+            duration_ms=duration_ms,
         )
-        session = await self._session_service.create_session(
-            app_name="skill_opt", user_id=uid
-        )
-        text = ""
-        async for event in runner.run_async(
-            user_id=uid,
-            session_id=session.id,
-            new_message=types.Content(parts=[types.Part(text=prompt)]),
-        ):
-            if hasattr(event, "content") and event.content:
-                for part in event.content.parts or []:
-                    if hasattr(part, "text") and part.text:
-                        text += part.text
         return text
 
     async def _ask_json(self, agent: Agent, prompt: str, fallback=None):
@@ -180,8 +265,16 @@ class SkillOptimizer:
         mutation_log = []
 
         # -- Baseline ---------------------------------------------------------
-        baseline = await self._score_skill(current_md, scenarios, evals)
-        baseline_pct = round(100 * baseline["passed"] / max(baseline["total"], 1), 1)
+        with traced_span(
+            "adk.baseline_score",
+            {
+                "scenario.count": len(scenarios),
+                "eval.count": len(evals),
+            },
+        ):
+            baseline = await self._score_skill(current_md, scenarios, evals)
+        baseline_pct = round(
+            100 * baseline["passed"] / max(baseline["total"], 1), 1)
         score_history.append(baseline_pct)
 
         await emit({
@@ -196,52 +289,54 @@ class SkillOptimizer:
 
         # -- Rounds -----------------------------------------------------------
         for rnd in range(1, max_rounds + 1):
-            await emit({"type": "experiment_start", "data": {"round": rnd}})
+            with traced_span("adk.optimization_round", {"round": rnd}):
+                await emit({"type": "experiment_start", "data": {"round": rnd}})
 
-            # Analyst diagnoses worst failure
-            analysis = await self._analyze_failures(
-                current_md, scenarios, evals, baseline["details"]
-            )
+                # Analyst diagnoses worst failure
+                analysis = await self._analyze_failures(
+                    current_md, scenarios, evals, baseline["details"]
+                )
 
-            # Mutator applies fix
-            mutation = await self._mutate_skill(current_md, analysis)
-            new_md = mutation.get("new_skill_md", current_md)
+                # Mutator applies fix
+                mutation = await self._mutate_skill(current_md, analysis)
+                new_md = mutation.get("new_skill_md", current_md)
 
-            # Re-score
-            result = await self._score_skill(new_md, scenarios, evals)
-            new_pct = round(100 * result["passed"] / max(result["total"], 1), 1)
+                # Re-score
+                result = await self._score_skill(new_md, scenarios, evals)
+                new_pct = round(
+                    100 * result["passed"] / max(result["total"], 1), 1)
 
-            kept = new_pct > baseline_pct
-            entry = {
-                "round": rnd,
-                "strategy_type": analysis.get("mutation_strategy", "unknown"),
-                "diagnosis": analysis.get("diagnosis", ""),
-                "description": mutation.get("description", ""),
-                "score_before": baseline_pct,
-                "score_after": new_pct,
-                "kept": kept,
-            }
-            mutation_log.append(entry)
-
-            if kept:
-                current_md = new_md
-                baseline = result
-                baseline_pct = new_pct
-
-            score_history.append(baseline_pct)
-
-            await emit({
-                "type": "experiment_result",
-                "data": {
+                kept = new_pct > baseline_pct
+                entry = {
                     "round": rnd,
-                    "score": new_pct,
-                    "kept": kept,
-                    "status": "kept" if kept else "discarded",
+                    "strategy_type": analysis.get("mutation_strategy", "unknown"),
+                    "diagnosis": analysis.get("diagnosis", ""),
                     "description": mutation.get("description", ""),
-                    "strategy": analysis.get("mutation_strategy", ""),
-                    "per_eval": result["per_eval"],
-                },
-            })
+                    "score_before": baseline_pct,
+                    "score_after": new_pct,
+                    "kept": kept,
+                }
+                mutation_log.append(entry)
+
+                if kept:
+                    current_md = new_md
+                    baseline = result
+                    baseline_pct = new_pct
+
+                score_history.append(baseline_pct)
+
+                await emit({
+                    "type": "experiment_result",
+                    "data": {
+                        "round": rnd,
+                        "score": new_pct,
+                        "kept": kept,
+                        "status": "kept" if kept else "discarded",
+                        "description": mutation.get("description", ""),
+                        "strategy": analysis.get("mutation_strategy", ""),
+                        "per_eval": result["per_eval"],
+                    },
+                })
 
         # -- Done -------------------------------------------------------------
         final_pct = baseline_pct
@@ -269,52 +364,65 @@ class SkillOptimizer:
 
     async def _score_skill(self, skill_md, scenarios, evals):
         """Executor runs all scenarios, then scores outputs."""
-        all_results = []
-        total_passed = 0
-        total_checks = 0
-        per_eval = {e["id"]: {"passed": 0, "total": 0} for e in evals}
+        with traced_span(
+            "adk.score_skill",
+            {
+                "scenario.count": len(scenarios),
+                "eval.count": len(evals),
+            },
+        ):
+            all_results = []
+            total_passed = 0
+            total_checks = 0
+            per_eval = {e["id"]: {"passed": 0, "total": 0} for e in evals}
 
-        for sc in scenarios:
-            # Executor runs the skill (free-form text)
-            output = await self._ask(
-                self.executor,
-                f"Execute this skill:\n\n{skill_md}\n\nUser request:\n{sc['input']}",
-            )
-            # Executor scores the output (JSON)
-            scoring = await self._ask_json(
-                self.executor,
-                (
-                    f"Evaluate this output against the criteria.\n\n"
-                    f"Input: {sc['input']}\n\n"
-                    f"Output: {output}\n\n"
-                    f"Criteria:\n{json.dumps(evals, indent=2)}\n\n"
-                    f"Return JSON: {{\"results\": [{{\"eval_id\": 1, \"passed\": true, \"reason\": \"...\"}}]}}"
-                ),
-                fallback={"results": []},
-            )
-            scores = scoring.get("results", []) if isinstance(scoring, dict) else scoring
+            for sc in scenarios:
+                with traced_span("adk.score_scenario", {"scenario.id": sc.get("id")}):
+                    # Executor runs the skill (free-form text)
+                    output = await self._ask(
+                        self.executor,
+                        f"Execute this skill:\n\n{skill_md}\n\nUser request:\n{sc['input']}",
+                    )
+                    # Executor scores the output (JSON)
+                    scoring = await self._ask_json(
+                        self.executor,
+                        (
+                            f"Evaluate this output against the criteria.\n\n"
+                            f"Input: {sc['input']}\n\n"
+                            f"Output: {output}\n\n"
+                            f"Criteria:\n{json.dumps(evals, indent=2)}\n\n"
+                            f"Return JSON: {{\"results\": [{{\"eval_id\": 1, \"passed\": true, \"reason\": \"...\"}}]}}"
+                        ),
+                        fallback={"results": []},
+                    )
+                    scores = scoring.get("results", []) if isinstance(
+                        scoring, dict) else scoring
 
-            for s in scores:
-                eid = s.get("eval_id")
-                passed = s.get("passed", False)
-                if passed:
-                    total_passed += 1
-                total_checks += 1
-                if eid in per_eval:
-                    per_eval[eid]["total"] += 1
-                    if passed:
-                        per_eval[eid]["passed"] += 1
-                all_results.append({**s, "scenario_id": sc["id"]})
+                    for s in scores:
+                        eid = s.get("eval_id")
+                        passed = s.get("passed", False)
+                        if passed:
+                            total_passed += 1
+                        total_checks += 1
+                        if eid in per_eval:
+                            per_eval[eid]["total"] += 1
+                            if passed:
+                                per_eval[eid]["passed"] += 1
+                        all_results.append({**s, "scenario_id": sc["id"]})
 
-        return {
-            "passed": total_passed,
-            "total": total_checks,
-            "per_eval": [
-                {"eval_id": k, **v, "pass_rate": round(v["passed"] / max(v["total"], 1) * 100, 1)}
-                for k, v in per_eval.items()
-            ],
-            "details": all_results,
-        }
+            return {
+                "passed": total_passed,
+                "total": total_checks,
+                "per_eval": [
+                    {
+                        "eval_id": k,
+                        **v,
+                        "pass_rate": round(v["passed"] / max(v["total"], 1) * 100, 1),
+                    }
+                    for k, v in per_eval.items()
+                ],
+                "details": all_results,
+            }
 
     async def _analyze_failures(self, skill_md, scenarios, evals, details):
         """Analyst agent diagnoses the worst failures."""

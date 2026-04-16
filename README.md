@@ -141,6 +141,9 @@ source venv/bin/activate  # On Windows: venv\Scripts\activate
 # Install dependencies
 pip install -r requirements.txt
 
+# Optional: install OpenTelemetry dependencies
+pip install -r requirements-observability.txt
+
 # Set up environment (optional — the app will prompt for your API key in the UI)
 cp .env.example .env
 # Edit .env and add your GOOGLE_API_KEY
@@ -295,12 +298,20 @@ For each round, the three agents collaborate:
 | `POST` | `/api/examples/{name}/load` | Load an example skill |
 | `GET` | `/api/status/{session_id}` | Poll-based status endpoint |
 | `GET` | `/health` | Health check |
+| `GET` | `/health/observability` | Observability config health |
 
 ## Configuration
 
 ### Backend
 
 The Gemini API key is passed from the frontend with each request. Optionally set `GOOGLE_API_KEY` in `.env` for local development. Server runs on port **8891**.
+
+The backend now includes non-breaking observability defaults:
+
+- Request correlation IDs (`X-Request-ID`) on all responses
+- Structured logging with request/session/event context
+- Optional OpenTelemetry tracing (disabled by default)
+- Prompt-response telemetry controls (metadata-only default)
 
 Upload limits:
 
@@ -310,6 +321,30 @@ Upload limits:
 - Text files only (`.md`, `.txt`, `.json`, `.yaml`, `.py`, `.js`, `.ts`, etc.)
 
 Sessions expire after **1 hour** automatically.
+
+### Observability Configuration
+
+Use `backend/.env.example` as a starting point. These values are safe defaults:
+
+| Variable | Default | Description |
+| -------- | ------- | ----------- |
+| `OBSERVABILITY_OTEL_ENABLED` | `false` | Enable OpenTelemetry initialization |
+| `OTEL_SERVICE_NAME` | `re-si-backend` | Service name attached to traces |
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | empty | OTLP endpoint for exporting spans |
+| `OTEL_EXPORTER_OTLP_INSECURE` | `true` | Use insecure OTLP transport (local/dev only) |
+| `OBSERVABILITY_OTEL_CONSOLE` | `false` | Print spans to console for local debugging |
+| `OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT` | `NO_CONTENT` | `NO_CONTENT` (metadata only), `true` (full content), `false` (disable) |
+| `LOGS_BUCKET_NAME` | empty | Enables prompt-response telemetry when set |
+
+Notes:
+
+- Prompt-response telemetry is inactive until `LOGS_BUCKET_NAME` is configured.
+- `NO_CONTENT` is the recommended privacy-safe mode.
+- Telemetry setup is fail-open: missing optional packages or exporter config will not break API requests.
+
+### Optional Third-Party Recommendation
+
+If you later need richer trace analysis, start with **Phoenix** as an optional add-on. Keep it disabled in default runtime and enable only in dedicated environments.
 
 ### Frontend
 
@@ -338,6 +373,25 @@ def __init__(self, api_key: str, model: str = "gemini-3-flash-preview"):
 ```bash
 cd backend
 python -c "from adk_optimizer import SkillOptimizer; print('OK')"
+```
+
+### Observability Verification
+
+```bash
+cd backend
+
+# Check observability status endpoint
+curl http://localhost:8891/health/observability
+
+# Confirm request correlation header is present
+curl -i http://localhost:8891/health
+```
+
+To test local tracing output, set these in `.env` and restart backend:
+
+```bash
+OBSERVABILITY_OTEL_ENABLED=true
+OBSERVABILITY_OTEL_CONSOLE=true
 ```
 
 ### Frontend Build

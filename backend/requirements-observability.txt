@@ -1,0 +1,6 @@
+# Optional observability dependencies.
+# Install only when enabling OpenTelemetry export/instrumentation.
+opentelemetry-api>=1.27.0
+opentelemetry-sdk>=1.27.0
+opentelemetry-exporter-otlp-proto-grpc>=1.27.0
+opentelemetry-instrumentation-fastapi>=0.48b0
