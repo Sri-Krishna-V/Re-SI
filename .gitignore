@@ -1,0 +1,47 @@
+# OS and editor files
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# Environment files (keep examples)
+.env
+.env.*
+!.env.example
+
+# Python / backend artifacts
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+.venv/
+venv/
+backend/.venv/
+backend/venv/
+
+# Node / frontend artifacts
+frontend/node_modules/
+frontend/.next/
+frontend/out/
+frontend/.turbo/
+frontend/.vercel/
+frontend/coverage/
+frontend/npm-debug.log*
+frontend/yarn-debug.log*
+frontend/yarn-error.log*
+frontend/pnpm-debug.log*
+
+# Generated output artifacts
+improved_skill.zip
+rsi_improved_skill.zip
+
+# Generic logs and temp files
+*.log
+tmp/
+temp/
